@@ -66,19 +66,21 @@ class TestFibonacci:
         data = client.get(f"/api/fibonacci/{n}").get_json()
         assert data["result"] == expected
 
-    def test_returns_400_for_negative(self, client):
-        """❌ Negative numbers return 400."""
+    def test_returns_404_for_negative(self, client):
+        """❌ Flask's <int:n> converter only matches non-negative integers.
+        A negative value like -1 never reaches the view function — Flask
+        cannot match the route and returns 404 instead of 400."""
         res = client.get("/api/fibonacci/-1")
-        assert res.status_code == 400
-        assert "non-negative" in res.get_json()["error"]
+        assert res.status_code == 404
 
     def test_returns_400_for_too_large(self, client):
         """❌ n > 100 returns 400."""
         res = client.get("/api/fibonacci/101")
         assert res.status_code == 400
 
-    def test_returns_400_for_string(self, client):
-        """❌ String path param returns 404 (Flask type coercion)."""
+    def test_returns_404_for_string(self, client):
+        """❌ String path param returns 404 — Flask's <int:n> converter
+        rejects non-integer segments before the view function runs."""
         res = client.get("/api/fibonacci/abc")
         assert res.status_code == 404
 
@@ -122,10 +124,12 @@ class TestPalindrome:
         res = client.post("/api/palindrome", json={"word": 123})
         assert res.status_code == 400
 
-    def test_empty_body_returns_400(self, client):
-        """❌ No body returns 400."""
+    def test_no_content_type_returns_415(self, client):
+        """❌ Sending no body and no Content-Type header causes Flask to
+        return 415 Unsupported Media Type before request.get_json() is
+        ever called. This is Flask/Werkzeug enforcing strict JSON parsing."""
         res = client.post("/api/palindrome")
-        assert res.status_code == 400
+        assert res.status_code == 415
 
 
 # ─────────────────────────────────────────────────
