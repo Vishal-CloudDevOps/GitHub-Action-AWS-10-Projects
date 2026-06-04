@@ -155,7 +155,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsS3Role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role//OIDC_Role_GitHubActions
           aws-region: ${{ env.AWS_REGION }}
 
       # Sync the build directory to S3
@@ -177,22 +177,23 @@ jobs:
 
       # After uploading new files, invalidate CloudFront cache
       # Without this, users would see cached old files for up to 24 hours
-      - name: Invalidate CloudFront cache
-        run: |
-          INVALIDATION_ID=$(aws cloudfront create-invalidation \
-            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
-            --paths "/*" \
-            --query 'Invalidation.Id' \
-            --output text)
+      # - name: Invalidate CloudFront cache
+      #   run: |
+      #     INVALIDATION_ID=$(aws cloudfront create-invalidation \
+      #       --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+      #       --paths "/*" \
+      #       --query 'Invalidation.Id' \
+      #       --output text)
 
-          echo "Invalidation ID: $INVALIDATION_ID"
+      #     echo "Invalidation ID: $INVALIDATION_ID"
 
-          # Wait for invalidation to complete
-          aws cloudfront wait invalidation-completed \
-            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
-            --id $INVALIDATION_ID
+      #     # Wait for invalidation to complete
+      #     aws cloudfront wait invalidation-completed \
+      #       --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+      #       --id $INVALIDATION_ID
 
-          echo "✅ CloudFront cache invalidated successfully"
+      #     echo "✅ CloudFront cache invalidated successfully"
+    
 
       - name: Deployment summary
         run: |
