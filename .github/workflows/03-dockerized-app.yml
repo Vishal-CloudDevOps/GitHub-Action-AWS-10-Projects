@@ -126,7 +126,7 @@ jobs:
         with:
           # This is the IAM role GitHub assumes via OIDC
           # You create this role in AWS IAM with a trust policy for GitHub
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsECRRole
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/OIDC_Role_GitHubActions
           aws-region: ${{ env.AWS_REGION }}
           # Token lasts 1 hour — enough for most builds
           role-session-name: GitHubActions-Project03-${{ github.run_id }}
