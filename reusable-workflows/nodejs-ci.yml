@@ -1,0 +1,77 @@
+# ============================================================
+# Reusable Workflow — Node.js CI
+# ============================================================
+# Call this from any project workflow with:
+#
+#   jobs:
+#     ci:
+#       uses: ./.github/workflows/reusable-nodejs-ci.yml
+#       with:
+#         working-directory: project-01-nodejs-basic-ci
+#         node-version: '20'
+# ============================================================
+
+name: Reusable — Node.js CI
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: 'Directory containing package.json'
+      node-version:
+        required: false
+        type: string
+        default: '20'
+      run-lint:
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        required: false
+        type: string
+        default: '80'
+    outputs:
+      coverage-artifact-name:
+        description: 'Name of the uploaded coverage artifact'
+        value: ${{ jobs.ci.outputs.coverage-artifact-name }}
+
+jobs:
+  ci:
+    name: Node.js CI (${{ inputs.node-version }})
+    runs-on: ubuntu-latest
+    outputs:
+      coverage-artifact-name: coverage-${{ github.sha }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        if: inputs.run-lint
+        run: npm run lint
+
+      - name: Test with coverage
+        run: npm test
+        env:
+          CI: true
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: ${{ inputs.working-directory }}/coverage/
+          retention-days: 14

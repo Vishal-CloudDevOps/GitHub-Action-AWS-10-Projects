@@ -1,0 +1,2 @@
+# Production dependencies (bundled with Lambda deployment package)
+# Keep this minimal — Lambda has a 250MB unzipped limit

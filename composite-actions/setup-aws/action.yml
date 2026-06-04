@@ -1,0 +1,54 @@
+# ============================================================
+# Composite Action — Setup AWS Credentials
+# ============================================================
+# Wraps aws-actions/configure-aws-credentials with sensible
+# defaults for OIDC authentication.
+#
+# Usage in a workflow:
+#
+#   steps:
+#     - uses: ./.github/composite-actions/setup-aws
+#       with:
+#         role-name: GitHubActionsECRRole
+#         aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+# ============================================================
+
+name: Setup AWS Credentials
+description: 'Configure AWS credentials via OIDC with consistent session naming'
+
+inputs:
+  role-name:
+    description: 'IAM role name to assume (not the full ARN)'
+    required: true
+  aws-account-id:
+    description: 'AWS Account ID'
+    required: true
+  aws-region:
+    description: 'AWS Region'
+    required: false
+    default: 'us-east-1'
+
+outputs:
+  aws-account-id:
+    description: 'The AWS account ID that was configured'
+    value: ${{ steps.configure.outputs.aws-account-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC)
+      id: configure
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/${{ inputs.role-name }}
+        aws-region: ${{ inputs.aws-region }}
+        # Consistent session naming helps with CloudTrail audit logs
+        role-session-name: GitHubActions-${{ github.workflow }}-${{ github.run_id }}
+
+    - name: Verify credentials
+      shell: bash
+      run: |
+        echo "✅ AWS credentials configured"
+        echo "   Region: ${{ inputs.aws-region }}"
+        echo "   Role:   ${{ inputs.role-name }}"
+        aws sts get-caller-identity --query 'Arn' --output text

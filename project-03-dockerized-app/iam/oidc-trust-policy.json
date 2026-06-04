@@ -1,0 +1,30 @@
+{
+  "_comment": "IAM Trust Policy for GitHub Actions OIDC — Project 03",
+  "_instructions": [
+    "1. Go to AWS Console → IAM → Identity Providers → Add Provider",
+    "2. Provider URL: https://token.actions.githubusercontent.com",
+    "3. Audience: sts.amazonaws.com",
+    "4. Create a new IAM Role with this trust policy",
+    "5. Attach the permissions policy (ecr-permissions-policy.json) to the role",
+    "6. Copy the role ARN and set it as the 'role-to-assume' in your workflow"
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "_comment": "Restrict to your specific GitHub org/repo — change this!",
+          "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/github-actions-aws-cicd-learning:*"
+        }
+      }
+    }
+  ]
+}

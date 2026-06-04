@@ -1,0 +1,55 @@
+# ============================================================
+# Kubernetes Service — exposes pods internally
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: project-09-app
+  namespace: project-09
+  labels:
+    app: project-09-app
+spec:
+  type: ClusterIP     # Internal only — Ingress handles external traffic
+  selector:
+    app: project-09-app
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+
+---
+# ============================================================
+# Kubernetes Namespace
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: project-09
+  labels:
+    name: project-09
+
+---
+# ============================================================
+# Horizontal Pod Autoscaler
+# Scales between 2 and 10 replicas based on CPU usage
+# ============================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: project-09-app-hpa
+  namespace: project-09
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: project-09-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

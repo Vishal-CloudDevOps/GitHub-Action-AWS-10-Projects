@@ -1,0 +1,519 @@
+# ============================================================
+# Project 10 — Enterprise Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - Parallel security scanning jobs (CodeQL, Trivy, Gitleaks)
+#   - SBOM generation with Syft (Software Bill of Materials)
+#   - Semantic versioning with semantic-release
+#   - GitHub Releases with auto-generated release notes
+#   - Slack notifications (start / success / failure)
+#   - Reusable workflow calls for deploy stages
+#   - Rollback job triggered on deploy failure
+#   - Dependency graph with needs: chains
+#   - Concurrency groups preventing overlapping production deploys
+#   - Environment protection approvals
+#   - Job summaries with rich Markdown output
+# ============================================================
+
+name: 10 — Enterprise Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'project-10-enterprise-pipeline/**'
+      - '.github/workflows/10-enterprise-pipeline.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'project-10-enterprise-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (emergency deploy only)'
+        type: boolean
+        default: false
+      rollback_version:
+        description: 'Roll back to this version (leave empty for normal deploy)'
+        type: string
+        required: false
+
+permissions:
+  contents: write        # Push version commits, create releases
+  id-token: write        # OIDC AWS auth
+  packages: write        # Push to GHCR
+  security-events: write # Upload SARIF scans
+  issues: write          # Create issues on failure
+  pull-requests: write   # PR comments
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: project-10-app
+  NODE_VERSION: '20'
+
+concurrency:
+  group: enterprise-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel production pipelines
+
+jobs:
+  # ══════════════════════════════════════════════════════════
+  # STAGE 1: SECURITY SCANS (all run in parallel)
+  # ══════════════════════════════════════════════════════════
+
+  secret-scan:
+    name: 🔐 Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast-codeql:
+    name: 🔬 SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+  dependency-scan:
+    name: 🛡️ Dependency Scan (npm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project-10-enterprise-pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: project-10-enterprise-pipeline/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high
+        continue-on-error: true
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 2: CI — LINT & TEST
+  # ══════════════════════════════════════════════════════════
+
+  ci:
+    name: 🧪 CI — Lint & Test
+    runs-on: ubuntu-latest
+    needs: [secret-scan]
+    if: ${{ !inputs.skip_tests }}
+    defaults:
+      run:
+        working-directory: project-10-enterprise-pipeline
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: project-10-enterprise-pipeline/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          CI: true
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: enterprise-coverage-${{ github.sha }}
+          path: project-10-enterprise-pipeline/coverage/
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 3: DOCKER BUILD, SCAN & SBOM
+  # ══════════════════════════════════════════════════════════
+
+  build-and-scan:
+    name: 🐳 Build, Scan & Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [ci, sast-codeql, dependency-scan]
+    if: always() && needs.secret-scan.result == 'success' && (needs.ci.result == 'success' || inputs.skip_tests)
+    outputs:
+      image-uri: ${{ steps.set-outputs.outputs.image-uri }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEnterpriseRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: project-10-enterprise-pipeline
+          push: false
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            BUILT_AT=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Trivy container vulnerability scan
+      - name: Trivy CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      # Trivy filesystem scan (catches IaC misconfigs too)
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: project-10-enterprise-pipeline
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: '0'   # Don't fail on fs scan — informational
+
+      # Generate SBOM (Software Bill of Materials)
+      # Lists every dependency and its version — required for compliance
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          retention-days: 90   # Keep SBOMs for compliance auditing
+
+      # Push to ECR (only on non-PR runs after all scans pass)
+      - name: Push to ECR
+        id: build
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: project-10-enterprise-pipeline
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set outputs
+        id: set-outputs
+        if: github.event_name != 'pull_request'
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          echo "image-uri=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 4: SEMANTIC VERSIONING & GITHUB RELEASE
+  # Only runs on push to main
+  # ══════════════════════════════════════════════════════════
+
+  release:
+    name: 🏷️ Semantic Release
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      version: ${{ steps.semantic.outputs.new_release_version }}
+      released: ${{ steps.semantic.outputs.new_release_published }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Semantic-release needs full history to determine next version
+          fetch-depth: 0
+          # Use a token that can push version commits back to the repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: project-10-enterprise-pipeline/package-lock.json
+
+      - name: Install semantic-release deps
+        run: npm ci
+        working-directory: project-10-enterprise-pipeline
+
+      - name: Run semantic-release
+        id: semantic
+        # semantic-release analyzes commit messages (feat/fix/BREAKING CHANGE)
+        # and automatically bumps the version + creates a GitHub Release
+        run: npx semantic-release
+        working-directory: project-10-enterprise-pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download SBOM artifact
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+
+      - name: Attach SBOM to GitHub Release
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.semantic.outputs.new_release_version }}
+          files: sbom.spdx.json
+          fail_on_unmatched_files: false
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 5: NOTIFY START OF DEPLOYMENT
+  # ══════════════════════════════════════════════════════════
+
+  notify-start:
+    name: 📢 Notify Deployment Start
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, release]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.build-and-scan.result == 'success'
+
+    steps:
+      - name: Send Slack notification (deploy starting)
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          # SLACK_WEBHOOK_URL must be an Incoming Webhook URL
+          payload: |
+            {
+              "text": "🚀 *Deployment Starting*",
+              "attachments": [{
+                "color": "#0066CC",
+                "fields": [
+                  {"title": "Repository", "value": "${{ github.repository }}", "short": true},
+                  {"title": "Version", "value": "${{ needs.release.outputs.version || github.sha }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Triggered by", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Workflow", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true  # Don't fail pipeline if Slack is unavailable
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 6: DEPLOY TO PRODUCTION (with approval gate)
+  # ══════════════════════════════════════════════════════════
+
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, release, notify-start]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.build-and-scan.result == 'success'
+    environment:
+      name: production
+      url: https://your-app.example.com
+    outputs:
+      deploy_success: ${{ steps.deploy.outputs.success }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEnterpriseRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to production
+        id: deploy
+        run: |
+          echo "🚀 Deploying ${{ needs.build-and-scan.outputs.image-uri }} to production"
+          echo "[Simulated] Updating ECS/EKS/Lambda with new image..."
+          echo "[Simulated] Waiting for stability..."
+          sleep 2
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "✅ Production deployment complete"
+
+      - name: Post-deploy smoke test
+        run: |
+          echo "🔍 Running smoke tests against production..."
+          # curl -f https://your-app.example.com/health
+          echo "✅ Production smoke tests passed"
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 7: ROLLBACK (if deploy fails)
+  # ══════════════════════════════════════════════════════════
+
+  rollback:
+    name: ⏪ Rollback Production
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    # Only run if deploy job failed
+    if: failure() && needs.deploy-production.result == 'failure'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEnterpriseRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get previous stable version from ECR
+        id: prev-version
+        run: |
+          # Find the most recent image that isn't the current failed one
+          PREV_TAG=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --query 'sort_by(imageDetails, &imagePushedAt)[-2].imageTags[0]' \
+            --output text 2>/dev/null || echo "")
+
+          if [[ -z "$PREV_TAG" || "$PREV_TAG" == "None" ]]; then
+            echo "❌ No previous version found to roll back to"
+            exit 1
+          fi
+
+          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "Found previous version: $PREV_TAG"
+
+      - name: Execute rollback
+        run: |
+          chmod +x project-10-enterprise-pipeline/scripts/rollback.sh
+          project-10-enterprise-pipeline/scripts/rollback.sh \
+            production \
+            "${{ steps.prev-version.outputs.tag }}"
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Create GitHub Issue for failed deploy
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Production deployment failed — rolled back (Run #${{ github.run_number }})`,
+              body: `## Production Deployment Failure\n\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n**Commit:** \`${{ github.sha }}\`\n**Triggered by:** ${{ github.actor }}\n\n**Action taken:** Automatically rolled back to previous stable version.\n\n**Next steps:**\n- [ ] Investigate root cause\n- [ ] Fix and re-deploy\n- [ ] Close this issue`,
+              labels: ['production-incident', 'deployment-failure']
+            });
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 8: FINAL NOTIFICATIONS
+  # ══════════════════════════════════════════════════════════
+
+  notify-complete:
+    name: 📢 Notify Complete
+    runs-on: ubuntu-latest
+    needs: [deploy-production, rollback]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Determine outcome
+        id: outcome
+        run: |
+          if [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
+            echo "color=#28a745" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "status=SUCCESS" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.rollback.result }}" == "success" ]]; then
+            echo "color=#ff9900" >> $GITHUB_OUTPUT
+            echo "emoji=⏪" >> $GITHUB_OUTPUT
+            echo "status=ROLLED BACK" >> $GITHUB_OUTPUT
+          else
+            echo "color=#dc3545" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "status=FAILED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send final Slack notification
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.outcome.outputs.emoji }} *Deployment ${{ steps.outcome.outputs.status }}*",
+              "attachments": [{
+                "color": "${{ steps.outcome.outputs.color }}",
+                "fields": [
+                  {"title": "Repository", "value": "${{ github.repository }}", "short": true},
+                  {"title": "Status", "value": "${{ steps.outcome.outputs.status }}", "short": true},
+                  {"title": "Actor", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>", "short": true}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+
+      - name: Write final pipeline summary
+        run: |
+          echo "## 🏢 Enterprise Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scan | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| CodeQL SAST | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Scan | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI (Lint + Test) | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build + Trivy | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM Generated | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semantic Release | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| Production Deploy | ${{ needs.deploy-production.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollback | ${{ needs.rollback.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Final Status:** ${{ steps.outcome.outputs.emoji }} ${{ steps.outcome.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

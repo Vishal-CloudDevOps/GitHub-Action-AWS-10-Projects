@@ -1,0 +1,229 @@
+# Project 10 — Enterprise Pipeline
+
+![CI](https://img.shields.io/github/actions/workflow/status/YOUR_ORG/github-actions-aws-cicd-learning/10-enterprise-pipeline.yml)
+![Release](https://img.shields.io/github/v/release/YOUR_ORG/github-actions-aws-cicd-learning)
+![Security](https://img.shields.io/badge/Security-CodeQL%20%7C%20Trivy%20%7C%20SBOM-green)
+
+> **Level:** ⭐⭐⭐⭐⭐ Expert
+> **Concepts:** CodeQL · SBOM · Semantic versioning · Slack notifications · Automatic rollback · GitHub Issues on failure · Parallel security stages
+
+---
+
+## 📖 What This Project Does
+
+The capstone project — a production-grade enterprise CI/CD pipeline featuring parallel security scans, SBOM generation, semantic versioning, Slack notifications, automatic rollback on deploy failure, and GitHub Issue creation for incidents.
+
+---
+
+## 🏗️ Architecture
+
+```
+Push to main
+     │
+     ▼
+╔═══════════════════════════════════════════════════════╗
+║  STAGE 1: PARALLEL SECURITY SCANS                    ║
+║  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐  ║
+║  │ Gitleaks     │ │ CodeQL SAST  │ │ npm audit    │  ║
+║  │ (secrets)    │ │ (JS/TS code) │ │ (deps CVEs)  │  ║
+║  └──────────────┘ └──────────────┘ └──────────────┘  ║
+╚═══════════════════════════════════════════════════════╝
+     │
+     ▼
+╔══════════════════════════════╗
+║  STAGE 2: CI                 ║
+║  Lint + Jest + Coverage      ║
+╚══════════════════════════════╝
+     │
+     ▼
+╔══════════════════════════════════════════════════════╗
+║  STAGE 3: BUILD, SCAN & SBOM                        ║
+║  Docker Build → Trivy → SBOM (Syft) → ECR Push     ║
+╚══════════════════════════════════════════════════════╝
+     │
+     ▼
+╔══════════════════════════════════════════════════════╗
+║  STAGE 4: SEMANTIC RELEASE                           ║
+║  Analyze commits → bump version → GitHub Release    ║
+║  → attach SBOM to release                           ║
+╚══════════════════════════════════════════════════════╝
+     │
+     ▼
+📢 Slack: "Deployment Starting"
+     │
+     ▼
+╔══════════════════════════════╗
+║  STAGE 5: PRODUCTION DEPLOY  ║ ◄── ⏸️ Manual Approval
+║  (environment protection)    ║
+╚══════════════════════════════╝
+     │
+     ├── SUCCESS ──▶ 📢 Slack: "✅ Deployment Succeeded"
+     │
+     └── FAILURE ──▶ ⏪ Auto Rollback
+                         │
+                         ├── 📢 Slack: "⏪ Rolled Back"
+                         └── 🐛 Create GitHub Issue
+```
+
+---
+
+## 🎯 Learning Objectives
+
+- [ ] How parallel security jobs (CodeQL, Trivy, Gitleaks) run simultaneously
+- [ ] What a **SBOM** (Software Bill of Materials) is and why it matters for compliance
+- [ ] How **semantic-release** automates versioning using conventional commits
+- [ ] How Slack webhooks send pipeline notifications
+- [ ] How `if: failure()` triggers a rollback job when deploy fails
+- [ ] How `github-script` creates GitHub Issues programmatically
+- [ ] How to attach SBOM files to GitHub Releases
+- [ ] How `continue-on-error: true` prevents non-critical jobs from blocking the pipeline
+- [ ] Why `cancel-in-progress: false` is critical for production pipelines
+
+---
+
+## 📁 Folder Structure
+
+```
+project-10-enterprise-pipeline/
+├── src/
+│   ├── app.js
+│   └── app.test.js
+├── scripts/
+│   └── rollback.sh                 # Rollback automation script
+├── .github/
+│   └── workflows/
+│       └── 10-enterprise-pipeline.yml
+├── package.json                    # Includes semantic-release config
+└── README.md
+```
+
+---
+
+## 🔑 GitHub Secrets Required
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ACCOUNT_ID` | Your 12-digit AWS account ID |
+| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL |
+| `GITHUB_TOKEN` | Auto-provided — needs `contents: write` |
+
+---
+
+## 📢 Setting Up Slack Notifications
+
+### Step 1: Create Slack App
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App**
+2. Choose **From scratch** → name it `GitHub Actions`
+3. Go to **Incoming Webhooks** → turn on → **Add New Webhook to Workspace**
+4. Select channel → click **Allow**
+5. Copy the webhook URL
+
+### Step 2: Add to GitHub Secrets
+```
+Settings → Secrets and Variables → Actions → New secret
+Name: SLACK_WEBHOOK_URL
+Value: https://hooks.slack.com/services/T.../B.../xxx
+```
+
+---
+
+## 🏷️ Semantic Versioning
+
+This project uses **Conventional Commits** + **semantic-release**:
+
+| Commit Message | Version Bump |
+|---------------|-------------|
+| `fix: correct typo` | Patch (1.0.0 → 1.0.1) |
+| `feat: add greet endpoint` | Minor (1.0.0 → 1.1.0) |
+| `feat!: redesign API` or `BREAKING CHANGE:` | Major (1.0.0 → 2.0.0) |
+| `chore: update deps` | No release |
+| `docs: update README` | No release |
+
+semantic-release runs on `main` branch pushes, analyzes commit history since last tag, and:
+1. Determines next version number
+2. Generates CHANGELOG.md
+3. Creates a GitHub Release with release notes
+4. Tags the commit
+5. Attaches the SBOM to the release
+
+---
+
+## 🔬 SBOM (Software Bill of Materials)
+
+Generated by **Syft** in SPDX-JSON format. Contains:
+- All npm packages + versions
+- OS-level packages in the Docker image
+- Licenses for each dependency
+- Package checksums
+
+SBOMs are required by US Executive Order 14028 for software supplied to federal agencies. Even if you're not a government supplier, generating them is a security best practice.
+
+```bash
+# View locally
+cat sbom.spdx.json | jq '.packages[] | {name: .name, version: .versionInfo}'
+```
+
+---
+
+## ⏪ Rollback Strategy
+
+The rollback is automatic when deploy fails:
+
+1. Query ECR for the second-most-recent image tag
+2. Deploy that image to production
+3. Run health check with 5 retries
+4. Notify Slack of rollback status
+5. Create GitHub Issue for incident tracking
+
+```bash
+# Manual rollback
+./scripts/rollback.sh production v1.2.3
+```
+
+---
+
+## 🐛 Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| CodeQL fails | Check workflow permissions include `security-events: write` |
+| semantic-release doesn't bump version | Ensure commits use Conventional Commits format |
+| Syft SBOM action fails | Update `anchore/sbom-action` version |
+| Slack notification not sent | Verify `SLACK_WEBHOOK_URL` secret and webhook is active |
+| Rollback finds no previous version | Second ECR image must exist; push at least two versions |
+| Release job fails on version commit | Ensure `GITHUB_TOKEN` has `contents: write` permission |
+
+---
+
+## 💰 AWS Cost Estimate
+
+Depends on deployment target — see Projects 04–09 for costs. The pipeline infrastructure itself is free.
+
+---
+
+## 🧹 Cleanup
+
+```bash
+# Delete ECR repository
+aws ecr delete-repository --repository-name project-10-app --force
+
+# Delete any CloudFormation stacks
+aws cloudformation delete-stack --stack-name project-10-*
+```
+
+---
+
+## 🎓 Congratulations!
+
+You've completed all 10 projects. You now have hands-on experience with:
+
+- ✅ Basic GitHub Actions structure
+- ✅ Matrix builds and caching
+- ✅ Docker builds with security scanning
+- ✅ AWS S3/CloudFront static deployments
+- ✅ Terraform infrastructure as code
+- ✅ ECS Fargate container deployments
+- ✅ Lambda serverless with SAM
+- ✅ Multi-environment promotion pipelines
+- ✅ Kubernetes EKS with Helm
+- ✅ Enterprise-grade pipelines with full security, observability, and automation

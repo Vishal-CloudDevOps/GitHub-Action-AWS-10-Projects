@@ -1,0 +1,131 @@
+# ============================================================
+# Reusable Workflow — Docker Build, Scan & ECR Push
+# ============================================================
+# Call this from any project workflow with:
+#
+#   jobs:
+#     docker:
+#       uses: ./.github/workflows/reusable-docker-ecr.yml
+#       with:
+#         context: project-03-dockerized-app
+#         ecr-repository: my-app
+#         aws-region: us-east-1
+#       secrets:
+#         AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+# ============================================================
+
+name: Reusable — Docker Build & ECR Push
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        required: true
+        type: string
+        description: 'Docker build context directory'
+      dockerfile:
+        required: false
+        type: string
+        default: 'Dockerfile'
+        description: 'Path to Dockerfile relative to context'
+      ecr-repository:
+        required: true
+        type: string
+        description: 'ECR repository name'
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-1'
+      push:
+        required: false
+        type: boolean
+        default: true
+        description: 'Whether to push image to ECR'
+      trivy-severity:
+        required: false
+        type: string
+        default: 'CRITICAL,HIGH'
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+    outputs:
+      image-uri:
+        description: 'Full ECR image URI with SHA tag'
+        value: ${{ jobs.docker.outputs.image-uri }}
+      image-tag:
+        description: 'Image tag (git SHA)'
+        value: ${{ jobs.docker.outputs.image-tag }}
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  docker:
+    name: Docker Build → ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.set-outputs.outputs.image-uri }}
+      image-tag: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsECRRole
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ inputs.ecr-repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ inputs.ecr-repository }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push to ECR
+        if: inputs.push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set outputs
+        id: set-outputs
+        run: |
+          echo "image-uri=${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}" \
+            >> $GITHUB_OUTPUT

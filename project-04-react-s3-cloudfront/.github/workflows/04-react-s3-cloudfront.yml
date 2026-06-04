@@ -1,0 +1,204 @@
+# ============================================================
+# Project 04 — React → S3 + CloudFront Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - Frontend build pipelines
+#   - Build environment variables (REACT_APP_*)
+#   - Uploading static files to S3 with aws s3 sync
+#   - CloudFront cache invalidation after deploy
+#   - Environment-specific S3 buckets
+#   - OIDC authentication for S3/CloudFront
+# ============================================================
+
+name: 04 — React Build & Deploy to S3/CloudFront
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'project-04-react-s3-cloudfront/**'
+      - '.github/workflows/04-react-s3-cloudfront.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'project-04-react-s3-cloudfront/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write     # OIDC AWS auth
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: your-react-app-bucket-name           # Replace with your bucket name
+  CLOUDFRONT_DISTRIBUTION_ID: ABCDEFGHIJKLMN      # Replace with your distribution ID
+
+concurrency:
+  group: react-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB: Secret Scan
+  # ──────────────────────────────────────────
+  secret-scan:
+    name: 🔐 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────
+  # JOB: Lint & Test
+  # ──────────────────────────────────────────
+  test:
+    name: 🧪 Lint & Test
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: project-04-react-s3-cloudfront
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: project-04-react-s3-cloudfront/package-lock.json
+      - run: npm ci
+      - name: Run ESLint
+        run: npm run lint
+      - name: Run tests
+        run: npm test
+        env:
+          CI: true
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-coverage
+          path: project-04-react-s3-cloudfront/coverage/
+          retention-days: 7
+
+  # ──────────────────────────────────────────
+  # JOB: Build
+  # ──────────────────────────────────────────
+  build:
+    name: 🔨 Build React App
+    runs-on: ubuntu-latest
+    needs: test
+    defaults:
+      run:
+        working-directory: project-04-react-s3-cloudfront
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: project-04-react-s3-cloudfront/package-lock.json
+      - run: npm ci
+
+      - name: Build for production
+        run: npm run build
+        env:
+          CI: true
+          # Inject build metadata into the React app
+          # These become available as process.env.REACT_APP_* in the app
+          REACT_APP_VERSION: ${{ github.sha }}
+          REACT_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+          REACT_APP_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+
+      - name: Analyze build output
+        run: |
+          echo "=== Build directory ==="
+          ls -lh build/
+          echo "=== Bundle sizes ==="
+          ls -lh build/static/js/*.js 2>/dev/null || echo "No JS files found"
+          ls -lh build/static/css/*.css 2>/dev/null || echo "No CSS files found"
+          echo "=== Total size ==="
+          du -sh build/
+
+      # Upload the build directory as an artifact so the deploy job can use it
+      # This avoids rebuilding in the deploy job
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build-${{ github.sha }}
+          path: project-04-react-s3-cloudfront/build/
+          retention-days: 14
+
+  # ──────────────────────────────────────────
+  # JOB: Deploy to S3
+  # Only runs on push to main (not PRs)
+  # ──────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to S3 + CloudFront
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://your-cloudfront-domain.cloudfront.net
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: react-build-${{ github.sha }}
+          path: build/
+
+      # OIDC Authentication — no keys stored in GitHub
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsS3Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Sync the build directory to S3
+      # --delete: removes files in S3 that no longer exist locally
+      # --cache-control: tells browsers and CloudFront how long to cache files
+      - name: Deploy to S3
+        run: |
+          # Deploy HTML files with no-cache (always fetch latest)
+          aws s3 sync build/ s3://${{ env.S3_BUCKET }}/ \
+            --delete \
+            --exclude "*.js" \
+            --exclude "*.css" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          # Deploy hashed JS/CSS files with long cache (1 year)
+          # These files have content hashes in their names, so stale cache is safe
+          aws s3 sync build/static/ s3://${{ env.S3_BUCKET }}/static/ \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # After uploading new files, invalidate CloudFront cache
+      # Without this, users would see cached old files for up to 24 hours
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+
+          echo "Invalidation ID: $INVALIDATION_ID"
+
+          # Wait for invalidation to complete
+          aws cloudfront wait invalidation-completed \
+            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --id $INVALIDATION_ID
+
+          echo "✅ CloudFront cache invalidated successfully"
+
+      - name: Deployment summary
+        run: |
+          echo "## 🎉 React App Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**S3 Bucket:** s3://${{ env.S3_BUCKET }}" >> $GITHUB_STEP_SUMMARY
+          echo "**CloudFront:** https://your-cloudfront-domain.cloudfront.net" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY

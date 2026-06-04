@@ -1,0 +1,262 @@
+# ============================================================
+# Project 02 — Python CI/CD Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - Matrix builds (multiple Python versions run in parallel)
+#   - pip dependency caching
+#   - flake8 linting + black format checking
+#   - bandit SAST (Static Application Security Testing)
+#   - pip-audit dependency vulnerability scanning
+#   - Artifact upload (coverage + build package)
+#   - Conditional steps (only upload once per matrix)
+# ============================================================
+
+name: 02 — Python CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'project-02-python-ci-cd/**'
+      - '.github/workflows/02-python-ci-cd.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'project-02-python-ci-cd/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB: Secret Scanning
+  # ──────────────────────────────────────────
+  secret-scan:
+    name: 🔐 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────
+  # JOB: Lint & Format
+  # ──────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Format (flake8 + black)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: project-02-python-ci-cd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # Cache pip downloads — much faster on repeated runs
+          cache: 'pip'
+          cache-dependency-path: project-02-python-ci-cd/requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run flake8 style check
+        # E501 = line too long (we use black for that)
+        run: flake8 app/ tests/ --max-line-length=100 --ignore=E501,W503
+
+      - name: Run black format check
+        # --check: don't reformat, just fail if files would change
+        run: black --check app/ tests/
+
+  # ──────────────────────────────────────────
+  # JOB: SAST Security Scan (bandit)
+  # ──────────────────────────────────────────
+  sast:
+    name: 🛡️ SAST Scan (bandit)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: project-02-python-ci-cd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: project-02-python-ci-cd/requirements-dev.txt
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Run bandit SAST scan
+        # -r: recursive, -ll: only medium+ severity, -ii: only medium+ confidence
+        run: bandit -r app/ -ll -ii --format json -o bandit-report.json
+        continue-on-error: true
+
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: project-02-python-ci-cd/bandit-report.json
+          retention-days: 14
+
+  # ──────────────────────────────────────────
+  # JOB: Dependency Audit (pip-audit)
+  # ──────────────────────────────────────────
+  dependency-audit:
+    name: 🔒 Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: project-02-python-ci-cd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: project-02-python-ci-cd/requirements.txt
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit production dependencies
+        run: pip-audit -r requirements.txt --format json -o pip-audit-report.json
+        continue-on-error: true
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: project-02-python-ci-cd/pip-audit-report.json
+          retention-days: 14
+
+  # ──────────────────────────────────────────
+  # JOB: Test (Matrix — Python 3.11 & 3.12)
+  # ──────────────────────────────────────────
+  test:
+    name: 🧪 Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [lint, sast]
+
+    # KEY CONCEPT: Matrix strategy
+    # This creates TWO parallel jobs — one for each Python version
+    # Both run simultaneously, cutting total wait time in half
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+      fail-fast: false  # Continue testing other versions even if one fails
+
+    defaults:
+      run:
+        working-directory: project-02-python-ci-cd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: project-02-python-ci-cd/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        run: pytest tests/ -v
+        env:
+          PYTHONPATH: .
+
+      - name: Upload coverage report
+        # Only upload coverage artifact once (for Python 3.12)
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: project-02-python-ci-cd/coverage.xml
+          retention-days: 14
+
+  # ──────────────────────────────────────────
+  # JOB: Build Artifact
+  # Creates a deployable package (tar.gz)
+  # ──────────────────────────────────────────
+  build:
+    name: 📦 Build Deployment Package
+    runs-on: ubuntu-latest
+    needs: test
+    defaults:
+      run:
+        working-directory: project-02-python-ci-cd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: project-02-python-ci-cd/requirements.txt
+
+      - name: Install production dependencies only
+        run: pip install -r requirements.txt --target ./package
+
+      - name: Copy app code into package
+        run: cp -r app/ package/
+
+      - name: Write version manifest
+        run: |
+          echo "{\"version\": \"${{ github.sha }}\", \"built_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+            > package/VERSION.json
+
+      - name: Create deployment archive
+        run: tar -czf flask-app-${{ github.sha }}.tar.gz package/
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flask-deployment-${{ github.sha }}
+          path: project-02-python-ci-cd/flask-app-${{ github.sha }}.tar.gz
+          retention-days: 30
+
+  # ──────────────────────────────────────────
+  # JOB: Summary
+  # ──────────────────────────────────────────
+  summary:
+    name: 📋 Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [lint, sast, test, build, dependency-audit]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          echo "## 🐍 Python CI Pipeline Summary — Project 02" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST | ${{ needs.sast.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests (3.11 & 3.12) | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result }} |" >> $GITHUB_STEP_SUMMARY

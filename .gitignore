@@ -1,0 +1,53 @@
+# Node.js
+node_modules/
+npm-debug.log*
+coverage/
+dist/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+*.tfvars
+!terraform.tfvars.example
+
+# Docker
+.dockerignore
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+*.tar.gz
+*.zip
+sbom.spdx.json
+trivy-*.sarif
+bandit-report.json
+pip-audit-report.json

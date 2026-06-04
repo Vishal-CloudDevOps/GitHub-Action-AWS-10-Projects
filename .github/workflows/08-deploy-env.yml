@@ -1,0 +1,105 @@
+# ============================================================
+# REUSABLE WORKFLOW — Deploy to Environment
+# ============================================================
+# This workflow is called by the main pipeline with different
+# environment parameters. It avoids duplicating deploy logic
+# across dev / staging / production jobs.
+#
+# Called with:
+#   uses: ./.github/workflows/08-deploy-env.yml
+#   with:
+#     environment: staging
+#     aws_region: us-east-1
+# ============================================================
+
+name: 08 — Deploy to Environment (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'Target environment: dev, staging, or production'
+      aws_region:
+        required: false
+        type: string
+        default: 'us-east-1'
+      app_version:
+        required: true
+        type: string
+        description: 'Git SHA or version tag'
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+    outputs:
+      deploy_url:
+        description: 'URL of the deployed application'
+        value: ${{ jobs.deploy.outputs.url }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.set-url.outputs.url }}
+
+    # The environment name controls which secrets and protection rules apply
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.set-url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load environment config
+        id: config
+        run: |
+          CONFIG_FILE="project-08-multi-environment/config/${{ inputs.environment }}/app-config.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            # Fall back to dev config for unknown environments
+            CONFIG_FILE="project-08-multi-environment/config/dev/app-config.json"
+          fi
+          echo "Using config: $CONFIG_FILE"
+          cat "$CONFIG_FILE"
+          # Export each config value as an environment variable
+          NODE_ENV=$(jq -r '.NODE_ENV' "$CONFIG_FILE")
+          FEATURE_NEW_UI=$(jq -r '.FEATURE_NEW_UI' "$CONFIG_FILE")
+          echo "node_env=$NODE_ENV" >> $GITHUB_OUTPUT
+          echo "feature_new_ui=$FEATURE_NEW_UI" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: GitHubActions-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Deploy to ${{ inputs.environment }}
+        run: |
+          echo "🚀 Deploying version ${{ inputs.app_version }} to ${{ inputs.environment }}"
+          echo "   NODE_ENV:        ${{ steps.config.outputs.node_env }}"
+          echo "   FEATURE_NEW_UI:  ${{ steps.config.outputs.feature_new_ui }}"
+          echo ""
+          echo "   [Simulated] Syncing files to S3 / updating ECS service / deploying Lambda..."
+          echo "   [Simulated] Running post-deploy health check..."
+          echo "✅ Deploy to ${{ inputs.environment }} complete"
+
+      - name: Set deployment URL output
+        id: set-url
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)        URL="https://dev.your-app.example.com" ;;
+            staging)    URL="https://staging.your-app.example.com" ;;
+            production) URL="https://your-app.example.com" ;;
+            *)          URL="https://${{ inputs.environment }}.your-app.example.com" ;;
+          esac
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "**Deployed to:** $URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Smoke test
+        run: |
+          URL=${{ steps.set-url.outputs.url }}
+          echo "🔍 Smoke testing $URL/health ..."
+          # In a real pipeline, replace with: curl -f "$URL/health"
+          echo "✅ Smoke test passed for ${{ inputs.environment }}"

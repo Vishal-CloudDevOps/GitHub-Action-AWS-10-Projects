@@ -1,0 +1,49 @@
+# ============================================================
+# Helm Chart Values — project-09-app
+# ============================================================
+# Override these at deploy time with:
+#   helm upgrade --install app ./helm/app \
+#     --set image.tag=sha-abc123 \
+#     --set replicaCount=3
+
+replicaCount: 2
+
+image:
+  repository: YOUR_ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/project-09-app
+  tag: latest          # Overridden by CI pipeline with specific SHA
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "128Mi"
+    cpu: "200m"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+env:
+  NODE_ENV: production
+  PORT: "8080"
+
+livenessProbe:
+  path: /health
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  path: /ready
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+namespace: project-09

@@ -1,0 +1,251 @@
+# ============================================================
+# Project 09 — Kubernetes EKS Deployment Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - Authenticating kubectl to Amazon EKS via OIDC
+#   - Building and pushing Docker images to ECR
+#   - helm lint — validates chart syntax
+#   - helm upgrade --install — idempotent install/update
+#   - kubectl rollout status — waits for deployment stability
+#   - Helm --set to inject image tag at deploy time
+#   - kubectl get pods / logs for post-deploy verification
+# ============================================================
+
+name: 09 — Kubernetes EKS Deploy (Helm)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'project-09-kubernetes-eks/**'
+      - '.github/workflows/09-kubernetes-eks.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'project-09-kubernetes-eks/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: project-09-app
+  EKS_CLUSTER_NAME: project-09-cluster
+  HELM_RELEASE: project-09
+  K8S_NAMESPACE: project-09
+  HELM_CHART_PATH: project-09-kubernetes-eks/helm/app
+
+concurrency:
+  group: k8s-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: Test & Lint
+  # ──────────────────────────────────────────
+  test:
+    name: 🧪 Test & Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project-09-kubernetes-eks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: project-09-kubernetes-eks/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  # ──────────────────────────────────────────
+  # JOB 2: Helm Lint
+  # Validates the Helm chart templates syntax
+  # ──────────────────────────────────────────
+  helm-lint:
+    name: ⎈ Helm Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.14.3'
+
+      - name: Helm lint
+        # Validates chart structure, template syntax, and values
+        run: helm lint ${{ env.HELM_CHART_PATH }}
+
+      - name: Helm template (dry-run rendering)
+        # Renders all templates locally to catch issues before deploy
+        run: |
+          helm template ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART_PATH }} \
+            --set image.tag=test-sha \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --debug
+
+  # ──────────────────────────────────────────
+  # JOB 3: Build, Scan & Push Docker Image
+  # ──────────────────────────────────────────
+  build-push:
+    name: 🐳 Build, Scan & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [test, helm-lint]
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.tag }}
+      image-uri: ${{ steps.set-tag.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEKSRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build locally first for Trivy scanning
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: project-09-kubernetes-eks
+          push: false
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Upload Trivy results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push to ECR
+        if: github.event_name != 'pull_request'
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Set image tag output
+        id: set-tag
+        if: github.event_name != 'pull_request'
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "uri=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────
+  # JOB 4: Deploy to EKS via Helm
+  # ──────────────────────────────────────────
+  deploy-eks:
+    name: ⎈ Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://your-eks-ingress-url.example.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.14.3'
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.29.0'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEKSRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Update local kubeconfig so kubectl and helm can reach the EKS cluster
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml \
+            | kubectl apply -f -
+
+      # helm upgrade --install:
+      # - If release doesn't exist → install it
+      # - If release exists → upgrade it (idempotent)
+      - name: Helm deploy
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.tag=${{ needs.build-push.outputs.image-tag }} \
+            --set image.repository=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }} \
+            --set replicaCount=2 \
+            --wait \
+            --timeout 5m \
+            --atomic    # Roll back automatically if deploy fails
+
+      # Wait for rollout and verify pods are healthy
+      - name: Verify rollout
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl rollout status deployment/${{ env.HELM_RELEASE }}-app \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=3m
+
+          echo "=== Running Pods ==="
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }}-app
+
+          echo "=== Pod Descriptions ==="
+          kubectl describe pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }}-app \
+            | grep -A5 "Events:"
+
+      - name: Deployment summary
+        run: |
+          echo "## ⎈ Kubernetes Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** ${{ env.EKS_CLUSTER_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** ${{ env.K8S_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Helm Release:** ${{ env.HELM_RELEASE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ needs.build-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=${{ env.HELM_RELEASE }}-app \
+            --no-headers 2>/dev/null | wc -l)
+          echo "**Running Pods:** $PODS" >> $GITHUB_STEP_SUMMARY

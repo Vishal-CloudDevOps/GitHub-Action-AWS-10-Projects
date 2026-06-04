@@ -1,0 +1,8 @@
+{
+  "NODE_ENV": "staging",
+  "PORT": "3000",
+  "LOG_LEVEL": "info",
+  "FEATURE_NEW_UI": "true",
+  "API_RATE_LIMIT": "500",
+  "DB_POOL_SIZE": "5"
+}

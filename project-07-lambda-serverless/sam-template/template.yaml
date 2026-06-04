@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+# ============================================================
+# AWS SAM Template — Project 07 Lambda Serverless API
+# ============================================================
+# SAM (Serverless Application Model) extends CloudFormation
+# with serverless-specific resource types.
+#
+# Deploy with: sam deploy --guided
+# ============================================================
+
+Description: Project 07 - Serverless REST API with Lambda + API Gateway
+
+# Parameters can be overridden at deploy time:
+# sam deploy --parameter-overrides Stage=production
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, production]
+    Description: Deployment stage
+
+  AppVersion:
+    Type: String
+    Default: "1.0.0"
+    Description: Application version (injected by CI)
+
+Globals:
+  # These settings apply to ALL functions unless overridden
+  Function:
+    Runtime: python3.12
+    Timeout: 30                 # seconds — Lambda max is 900
+    MemorySize: 256             # MB — adjust based on profiling
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        APP_VERSION: !Ref AppVersion
+    # X-Ray tracing for distributed debugging
+    Tracing: Active
+
+Resources:
+  # ── Lambda Function ────────────────────────────────────────
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "project-07-api-${Stage}"
+      # CodeUri is the directory that gets zipped and uploaded to S3
+      CodeUri: src/
+      Handler: handler.lambda_handler
+      Description: "Project 07 serverless REST API"
+
+      # API Gateway event source — SAM creates the API Gateway automatically
+      Events:
+        RootGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /
+            Method: GET
+
+        HealthGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /health
+            Method: GET
+
+        GreetGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/greet
+            Method: GET
+
+        CalculatePost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/calculate
+            Method: POST
+
+      Tags:
+        Project: github-actions-aws-cicd-learning
+        Stage: !Ref Stage
+
+  # ── API Gateway ────────────────────────────────────────────
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "project-07-api-${Stage}"
+      StageName: !Ref Stage
+      # Enable access logging
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength"}'
+      # Enable CORS for browser access
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # ── CloudWatch Log Groups ──────────────────────────────────
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/project-07-${Stage}"
+      RetentionInDays: 14
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/project-07-api-${Stage}"
+      RetentionInDays: 14
+
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "project-07-api-url-${Stage}"
+
+  FunctionArn:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt ApiFunction.Arn
+
+  FunctionName:
+    Description: "Lambda Function name"
+    Value: !Ref ApiFunction

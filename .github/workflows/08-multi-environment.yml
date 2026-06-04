@@ -1,0 +1,175 @@
+# ============================================================
+# Project 08 — Multi-Environment Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - dev → staging → production promotion flow
+#   - GitHub environment protection rules (approval gates)
+#   - Reusable workflow calls (workflow_call)
+#   - Branch-based deployment routing
+#   - Environment-specific secrets and variables
+#   - Concurrency per environment (no overlapping deploys)
+#   - Conditional jobs based on branch and event type
+#   - Manual workflow_dispatch with environment selection
+# ============================================================
+
+name: 08 — Multi-Environment Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'release/*']
+    paths:
+      - 'project-08-multi-environment/**'
+      - '.github/workflows/08-multi-environment.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'project-08-multi-environment/**'
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: 'Force deploy to specific environment'
+        required: true
+        type: choice
+        options: [dev, staging, production]
+
+permissions:
+  contents: read
+  id-token: write
+
+# Prevent concurrent deploys to the SAME environment
+# Different environments can deploy in parallel
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event.inputs.target_environment || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB: CI — Lint & Test (runs on every trigger)
+  # ──────────────────────────────────────────
+  ci:
+    name: 🧪 CI — Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project-08-multi-environment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: project-08-multi-environment/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          CI: true
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: project-08-multi-environment/coverage/
+          retention-days: 7
+
+  # ──────────────────────────────────────────
+  # DEPLOY TO DEV
+  # Triggers: push to develop OR manual dispatch to dev
+  # ──────────────────────────────────────────
+  deploy-dev:
+    name: 🟢 Deploy → Dev
+    needs: ci
+    if: |
+      (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target_environment == 'dev')
+
+    # KEY CONCEPT: Calling a reusable workflow
+    # This delegates all deploy logic to 08-deploy-env.yml
+    # Keeps this file clean and avoids duplication across environments
+    uses: ./.github/workflows/08-deploy-env.yml
+    with:
+      environment: dev
+      aws_region: us-east-1
+      app_version: ${{ github.sha }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  # ──────────────────────────────────────────
+  # DEPLOY TO STAGING
+  # Triggers: push to release/* branches OR manual dispatch
+  # Also runs after dev deploy succeeds on develop branch
+  # ──────────────────────────────────────────
+  deploy-staging:
+    name: 🟡 Deploy → Staging
+    needs: [ci, deploy-dev]
+    # Run if:
+    # - CI passed AND dev deploy succeeded (promote from dev to staging)
+    # - OR: it's a release/* branch push
+    # - OR: manual dispatch to staging
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      (
+        (needs.deploy-dev.result == 'success') ||
+        (startsWith(github.ref, 'refs/heads/release/') && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && inputs.target_environment == 'staging')
+      )
+    uses: ./.github/workflows/08-deploy-env.yml
+    with:
+      environment: staging
+      aws_region: us-east-1
+      app_version: ${{ github.sha }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  # ──────────────────────────────────────────
+  # DEPLOY TO PRODUCTION
+  # Triggers: push to main OR manual dispatch
+  # ALWAYS requires manual approval (GitHub environment protection)
+  # ──────────────────────────────────────────
+  deploy-production:
+    name: 🔴 Deploy → Production
+    needs: [ci, deploy-staging]
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.target_environment == 'production')
+      )
+    uses: ./.github/workflows/08-deploy-env.yml
+    with:
+      environment: production
+      aws_region: us-east-1
+      app_version: ${{ github.sha }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  # ──────────────────────────────────────────
+  # PIPELINE SUMMARY
+  # ──────────────────────────────────────────
+  summary:
+    name: 📋 Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [ci, deploy-dev, deploy-staging, deploy-production]
+    if: always()
+
+    steps:
+      - name: Write pipeline summary
+        run: |
+          echo "## 🌍 Multi-Environment Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status | Environment |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| CI | ${{ needs.ci.result }} | — |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dev Deploy | ${{ needs.deploy-dev.result }} | dev |" >> $GITHUB_STEP_SUMMARY
+          echo "| Staging Deploy | ${{ needs.deploy-staging.result }} | staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| Production Deploy | ${{ needs.deploy-production.result }} | production |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

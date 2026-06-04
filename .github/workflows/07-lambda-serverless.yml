@@ -1,0 +1,322 @@
+# ============================================================
+# Project 07 — Lambda Serverless CI/CD Pipeline
+# ============================================================
+# CONCEPTS TAUGHT:
+#   - SAM (Serverless Application Model) build and deploy
+#   - Lambda packaging and dependency bundling
+#   - API Gateway deployment stages (dev / production)
+#   - sam validate — template linting
+#   - sam build — dependency installation + packaging
+#   - sam deploy — CloudFormation changeset + deploy
+#   - Post-deploy smoke test against live API endpoint
+#   - Workflow outputs carrying API URL between jobs
+# ============================================================
+
+name: 07 — Lambda Serverless Deploy (SAM)
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'project-07-lambda-serverless/**'
+      - '.github/workflows/07-lambda-serverless.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'project-07-lambda-serverless/**'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Deployment stage'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, production]
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  SAM_TEMPLATE: project-07-lambda-serverless/sam-template/template.yaml
+  SAM_S3_BUCKET: your-sam-artifacts-bucket      # Replace with your bucket
+
+concurrency:
+  group: lambda-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: Secret Scanning
+  # ──────────────────────────────────────────
+  secret-scan:
+    name: 🔐 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────
+  # JOB 2: Lint, SAST & Tests
+  # ──────────────────────────────────────────
+  test:
+    name: 🧪 Lint, SAST & Tests
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: project-07-lambda-serverless
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: project-07-lambda-serverless/requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run flake8 lint
+        run: flake8 src/ tests/ --max-line-length=120 --ignore=E501,W503
+
+      - name: Run black format check
+        run: black --check src/ tests/
+
+      - name: Run bandit SAST scan
+        run: bandit -r src/ -ll -ii
+        continue-on-error: true
+
+      - name: Run pytest with coverage
+        run: pytest tests/ -v
+        env:
+          PYTHONPATH: .
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-coverage
+          path: project-07-lambda-serverless/coverage.xml
+          retention-days: 14
+
+  # ──────────────────────────────────────────
+  # JOB 3: SAM Validate
+  # Validates the CloudFormation/SAM template syntax
+  # ──────────────────────────────────────────
+  sam-validate:
+    name: ✅ SAM Template Validate
+    runs-on: ubuntu-latest
+    needs: secret-scan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsLambdaRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: SAM Validate
+        # Validates template syntax and checks resource types
+        run: sam validate --template ${{ env.SAM_TEMPLATE }} --region ${{ env.AWS_REGION }}
+
+  # ──────────────────────────────────────────
+  # JOB 4: SAM Build
+  # Installs Lambda dependencies, zips up code
+  # ──────────────────────────────────────────
+  sam-build:
+    name: 📦 SAM Build
+    runs-on: ubuntu-latest
+    needs: [test, sam-validate]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: SAM Build
+        # sam build: installs deps in requirements.txt into .aws-sam/build/
+        # --use-container: build inside a Lambda-compatible Docker container
+        # (ensures native extensions compile for Lambda's Amazon Linux)
+        run: |
+          sam build \
+            --template ${{ env.SAM_TEMPLATE }} \
+            --use-container \
+            --parallel
+
+      - name: Upload SAM build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sam-build-${{ github.sha }}
+          # .aws-sam/build contains the packaged Lambda code
+          path: .aws-sam/build/
+          retention-days: 7
+
+  # ──────────────────────────────────────────
+  # JOB 5: Deploy to Dev (develop branch)
+  # ──────────────────────────────────────────
+  deploy-dev:
+    name: 🚀 Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: sam-build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: dev
+    outputs:
+      api-url: ${{ steps.get-outputs.outputs.api-url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsLambdaRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download SAM build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sam-build-${{ github.sha }}
+          path: .aws-sam/build/
+
+      - name: SAM Deploy to Dev
+        run: |
+          sam deploy \
+            --template ${{ env.SAM_TEMPLATE }} \
+            --stack-name project-07-lambda-dev \
+            --s3-bucket ${{ env.SAM_S3_BUCKET }} \
+            --s3-prefix project-07/dev \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --parameter-overrides Stage=dev AppVersion=${{ github.sha }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Get API URL from stack outputs
+        id: get-outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name project-07-lambda-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)
+          echo "api-url=$API_URL" >> $GITHUB_OUTPUT
+          echo "**Dev API URL:** $API_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Smoke test dev deployment
+        run: |
+          API_URL=${{ steps.get-outputs.outputs.api-url }}
+          echo "Testing $API_URL/health ..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Health check failed: HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Dev smoke test passed"
+
+  # ──────────────────────────────────────────
+  # JOB 6: Deploy to Production (main branch)
+  # ──────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: sam-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    outputs:
+      api-url: ${{ steps.get-outputs.outputs.api-url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsLambdaRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download SAM build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sam-build-${{ github.sha }}
+          path: .aws-sam/build/
+
+      - name: SAM Deploy to Production
+        run: |
+          sam deploy \
+            --template ${{ env.SAM_TEMPLATE }} \
+            --stack-name project-07-lambda-production \
+            --s3-bucket ${{ env.SAM_S3_BUCKET }} \
+            --s3-prefix project-07/production \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --parameter-overrides Stage=production AppVersion=${{ github.sha }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Get API URL from stack outputs
+        id: get-outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name project-07-lambda-production \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)
+          echo "api-url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Smoke test production deployment
+        run: |
+          API_URL=${{ steps.get-outputs.outputs.api-url }}
+          echo "Testing $API_URL/health ..."
+          for i in 1 2 3; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Production smoke test passed (attempt $i)"
+              exit 0
+            fi
+            echo "⏳ Attempt $i: HTTP $HTTP_STATUS — retrying in 10s..."
+            sleep 10
+          done
+          echo "❌ Production smoke test failed after 3 attempts"
+          exit 1
+
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Lambda Production Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API URL:** ${{ steps.get-outputs.outputs.api-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack:** project-07-lambda-production" >> $GITHUB_STEP_SUMMARY
