@@ -11,11 +11,13 @@ app = Flask(__name__)
 @app.route("/")
 def index():
     """Root endpoint."""
-    return jsonify({
-        "message": "Hello from Project 02 — Python CI/CD!",
-        "status": "ok",
-        "version": "1.0.0"
-    })
+    return jsonify(
+        {
+            "message": "Hello from Project 02 — Python CI/CD!",
+            "status": "ok",
+            "version": "1.0.0",
+        }
+    )
 
 
 @app.route("/health")
@@ -71,13 +73,15 @@ def stats():
     if not all(isinstance(n, (int, float)) for n in numbers):
         return jsonify({"error": "All values must be numbers"}), 400
 
-    return jsonify({
-        "count": len(numbers),
-        "sum": sum(numbers),
-        "mean": sum(numbers) / len(numbers),
-        "min": min(numbers),
-        "max": max(numbers),
-    })
+    return jsonify(
+        {
+            "count": len(numbers),
+            "sum": sum(numbers),
+            "mean": sum(numbers) / len(numbers),
+            "min": min(numbers),
+            "max": max(numbers),
+        }
+    )
 
 
 if __name__ == "__main__":

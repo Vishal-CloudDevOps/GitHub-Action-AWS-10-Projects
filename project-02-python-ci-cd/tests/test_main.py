@@ -49,9 +49,18 @@ class TestHealth:
 # GET /api/fibonacci/<n>
 # ─────────────────────────────────────────────────
 class TestFibonacci:
-    @pytest.mark.parametrize("n,expected", [
-        (0, 0), (1, 1), (2, 1), (3, 2), (5, 5), (10, 55), (20, 6765),
-    ])
+    @pytest.mark.parametrize(
+        "n,expected",
+        [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (5, 5),
+            (10, 55),
+            (20, 6765),
+        ],
+    )
     def test_correct_values(self, client, n, expected):
         """✅ Returns correct Fibonacci numbers."""
         data = client.get(f"/api/fibonacci/{n}").get_json()
