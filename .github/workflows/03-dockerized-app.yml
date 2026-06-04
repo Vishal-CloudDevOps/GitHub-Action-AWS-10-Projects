@@ -23,7 +23,7 @@ on:
     branches: [main, develop]
     paths:
       - 'project-03-dockerized-app/**'
-      - '.github/workflows/03-docker-build-scan-push.yml'
+      - '.github/workflows/03-dockerized-app.yml'
     tags:
       - 'v*.*.*'
   pull_request:
@@ -364,4 +364,3 @@ jobs:
           needs.build.result == 'failure' ||
           needs.scan.result == 'failure'
         run: exit 1
-        
