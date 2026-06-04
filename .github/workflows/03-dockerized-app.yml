@@ -364,3 +364,4 @@ jobs:
           needs.build.result == 'failure' ||
           needs.scan.result == 'failure'
         run: exit 1
+        
