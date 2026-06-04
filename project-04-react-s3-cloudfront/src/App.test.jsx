@@ -1,3 +1,4 @@
+import '@testing-library/jest-dom'; // <-- This fixes the "toBeInTheDocument is not a function" error
 import { render, screen, fireEvent } from '@testing-library/react';
 import App from './App';
 
