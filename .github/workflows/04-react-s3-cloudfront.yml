@@ -122,7 +122,7 @@ jobs:
           echo "=== Total size ==="
           du -sh build/
 
-      # Upload the build directory as an artifact so the deploy job can use it
+        # Upload the build directory as an artifact so the deploy job can use it
       # This avoids rebuilding in the deploy job
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
