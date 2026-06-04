@@ -30,7 +30,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  S3_BUCKET: your-react-app-bucket-name           # Replace with your bucket name
+  S3_BUCKET: s3-static-website-project-4           # Replace with your bucket name
   CLOUDFRONT_DISTRIBUTION_ID: ABCDEFGHIJKLMN      # Replace with your distribution ID
 
 concurrency:
@@ -142,7 +142,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: production
-      url: https://your-cloudfront-domain.cloudfront.net
+      #url: https://your-cloudfront-domain.cloudfront.net
 
     steps:
       - name: Download build artifact
